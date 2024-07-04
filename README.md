@@ -1,6 +1,7 @@
 # TCMALakesWQTimeSeries
 <pre>
-Code used to create long-term summer, surface water quality time series for lakes in the Twin Cities seven county metro area.
+Code used to create long-term surface water quality time series for lakes in the Twin Cities seven county metro area.
+Lakes with > 5 years of data were included, which in 2023 consisted of 294 lakes.
 
 Timeseries_v6 is surface water data for lakes in the Twin Cities Metro area with long term monitoring data (5 years or more). Data was primarily sourced from the MPCA Water Quality Dashboard and was supplemented by data supplied by WMOs directly.
 
@@ -12,15 +13,12 @@ There is one reported value per lake x date x parameter which means that spatial
 Metadata:
 DOW*			Lake ID number used by MPCA
 sampleDate		Date of sampling, YYYY-MM-DD
-sampleYear		Year of sampling
 parameter**		Chemical parameter measured and units of measure
 result			result value, units are contained in the parameter name
 gtlt***			flag if result is below detection (1) or above max measurement (100) or no flag (0) 
 			         Detection limit or max measurement is reported as result
 dataSource		where the measurement was sourced from (MPCA WQ Dashboard or individual WMO)
 county			county where the lake is located
-Julian			Julian day calculated using yday from the lubridate r package
-Month			numerical month of the sampling date
 
 *DOWs are generally the ID numbers used by the DNR and MPCA except in the case of a few lakes in which DOWs were altered to deal with multi-basin lakes. See R script for details
 
