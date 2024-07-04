@@ -1,0 +1,1624 @@
+---
+title: "TCMA_Lake_WQ_Timeseries_v6"
+output: html_document
+date: "2024-05-06"
+---
+
+Goal: Harmonize surface water quality data from the MPCA water quality portal with data the MSP-LTER has directly received from WMOs for ~300 lakes that have high quality long term data. The resulting dataset should have a single value for every lake/date/parameter to allow for statistical analyses that aren't biased by duplicate sampling efforts that regularly occur in the metro. 
+
+History: In 2022 Grace Neumiller took an initial stab at harmonizing all of this data, resulting in v3. Katie Polik continued to update this code in order to correct errors in the original code and include previously ignored parameters (DIN, gtlt, etc.), resulting in v4 and v5. It eventually became clear that in order to retain gtlt and some indication of where each piece of information is coming from (MPCA vs WMO), this needed to be handled in long format instead of wide. Katie took this opportunity to rework all of the code into v6. Details about specific differences between past versions can be found in Timeseries_v5.R.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Outputs")
+
+library(openxlsx)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(mnsentinellakes)
+#If you have the MASS package loaded, the select function won't work without reassigning
+select <- dplyr::select
+```
+
+First we take an initial download of data from the MPCA for our lakes of interest and pull out parameters of interest. Individual lake data sets were combined using a looped API query in the Automate_API.R script.
+
+This section double checks units, removes a few bad data points, and filters data for the epilimnion.
+
+```{r Initial MPCA Cleaning}
+# load in combined MPCA data set
+MPCAtimeseries1 <- read.csv("MPCA_MassDownload_20240521.csv")
+
+# select all desired parameters
+# units should be
+    #nutrients and chloride: mg/L
+    #Chlorophyll:           ug/L
+    #Secchi:                m
+    #Conductivity:          uS/cm or uohm/cm (equivalent)
+
+# A summary of data corrections:
+# There are several "Phosphorus as P" values reported as ug/L, I've divided these by 1000
+# One sample has the depth unit as "mm" I've removed it
+# There is an exceedingly high nutrient-Nitrogen value for Powderhorn, I've removed it.
+# I've removed all negative reported values
+# Note some samples will load in with incorrect dates (year = 2076 for example). These are fixed later as this is a result of R reading '76 as 2076 instead of 1976
+
+MPCAOrg <- data.frame(MPCAtimeseries1) %>% 
+  rename(LAKENAME = stationName) %>%
+  filter((parameter == "Kjeldahl nitrogen as N") | 
+           (parameter == "Kjeldahl Nitrogen, Total as N") |
+           (parameter == "Nitrogen, Total Kjeldahl (TKN) as N") |
+           (parameter == "Nitrogen, total kjeldahl (TKN) as N") |
+           
+           (parameter == "Nitrogen as N") |
+           (parameter == "Nitrogen, total as N") | 
+           (parameter == "Nitrogen, Total as N") | 
+           (parameter == "Nutrient-nitrogen as N") | 
+           
+           (parameter == "Nitrite as N") | 
+           (parameter == "Nitrite as N as N") | 
+           (parameter == "Nitrate as N") |
+           (parameter == "Nitrate as N as N") |
+           (parameter == "Inorganic nitrogen (nitrate and nitrite) as N") | 
+           (parameter == "Nitrate + Nitrite Nitrogen, Total as N") |
+           (parameter == "Nitrate/Nitrite as N (N+N) as N") | 
+           (parameter == "Nitrate/Nitrite as N as N") |
+           
+           (parameter == "Ammonia Nitrogen, Total as N") |
+           (parameter == "Nitrogen, Ammonia as N") |
+           (parameter == "Nitrogen, ammonia, as N as N") |
+           (parameter == "Ammonia as N as N") |
+           (parameter == "Ammonia-nitrogen as N") |
+           
+           #(parameter == "Organic Nitrogen as N") |
+           
+           (parameter == "Phosphorus as P") | 
+           (parameter == "Phosphorus, Total as P") |
+           (parameter == "Phosphorus, Total as P as P") | 
+           (parameter == "Phosphorus, total as P as P") | 
+           
+           (parameter == "Chlorophyll a, uncorrected for pheophytin") | 
+           (parameter == "Chlorophyll-A") | 
+           (parameter == "Chlorophyll a - nonPC") |
+           (parameter == "Chlorophyll a, corrected for pheophytin") |
+           (parameter == "Chlorophyll a") |
+           (parameter == "Chlorophyll A") | 
+           (parameter == "Chlorophyll a, pheophytin-adjusted") |
+           (parameter == "Chlorophyll-a") |
+           (parameter == "Chlorophyll-a, Pheophytin Corrected") |
+           
+           (parameter == "Depth, Secchi disk depth") | 
+           (parameter == "Secchi disc") |
+           (parameter == "Specific conductance") | 
+           (parameter == "Chloride")) %>% 
+  
+  #remove dissolved fraction samples reported as TP, TKN, and TN
+  filter(!(parameter == "Phosphorus as P" & sampleFractionType == "Dissolved")) %>%
+  filter(!(parameter == "Kjeldahl nitrogen as N" & sampleFractionType == "Dissolved")) %>%
+  filter(!(parameter == "Nutrient-nitrogen as N" & sampleFractionType == "Dissolved")) %>%
+  
+  #metadata cleaning
+  select(collectingOrg, gtlt, parameter, sampleFractionType, result, resultUnit, 
+         sampleDate, sampleDepthUnit, sampleLowerDepth, sampleUpperDepth, 
+         stationId, LAKENAME, testMethodName) %>%
+  mutate(across(c(collectingOrg, gtlt, result, resultUnit, sampleDepthUnit, sampleLowerDepth, sampleUpperDepth), 
+                ~na_if(., "null"))) %>%
+  mutate(across(c(result, sampleUpperDepth, sampleLowerDepth), ~as.numeric(.))) %>%
+  drop_na(result, resultUnit) %>% 
+  
+  #reformat DOWs
+  mutate(siteID = substr(stationId,12,14),
+         DOW = fixlakeid(substr(stationId, 1,11))) %>%
+  
+  #FIX DATES (it's important to do this first so dates with different formats don't separate as we group data)
+  mutate(sampleDate = as.Date(parse_date_time(sampleDate, orders = c('mdy', 'ymd')))) %>%
+  #the next line fixes the issue with R reading some dates as 2000s instead of 1900s
+  mutate(sampleDate = if_else(year(sampleDate) > 2045, 
+                              sampleDate %m-% months(12*100), sampleDate)) %>%
+  
+ 
+  #unify sample depth units
+  filter((sampleDepthUnit != "mm") %>% replace_na(T)) %>% #remove a single conductivity sample with mm units (typo?)
+  mutate(sampleUpperDepth = if_else(sampleDepthUnit == "ft", 
+                                    sampleUpperDepth/3.281,sampleUpperDepth),
+         sampleLowerDepth = if_else(sampleDepthUnit == "ft", 
+                                    sampleLowerDepth/3.281, sampleLowerDepth)) %>%
+  
+  #Some samples have NA for upper and lower sampling depths. We will assume these are surface samples. 
+      #A bit of spot checking makes this assumption seem okay.
+  #Double NAs will drop out in the next step so I'm going to replace sampleUpperDepth with 1
+  mutate(sampleUpperDepth = if_else(is.na(sampleUpperDepth) & is.na(sampleLowerDepth), 1, sampleUpperDepth))%>%
+  
+  #slice out the most shallow value from any profiles taken
+      #Note that this returns all rows that have the min sampleDepth so there might be multiple rows per site/date
+      #This is usually because two different groups took a surface sample at the same site on the same day
+      #These will be averaged out later
+  rowwise() %>%
+  mutate(sampleDepth = mean(c(sampleUpperDepth, sampleLowerDepth),na.rm=T)) %>%
+  group_by(DOW, sampleDate, siteID, parameter) %>% 
+  filter(sampleDepth == min(sampleDepth)) %>%
+  ungroup() %>%
+  
+  #filter for only surface samples
+  filter(sampleUpperDepth <= 2 | is.na(sampleUpperDepth)) %>%
+  filter(sampleLowerDepth <= 2 | is.na(sampleLowerDepth)) %>%
+  
+  
+  #filter outliers and fix unit problems
+  filter(result >= 0) %>% #remove negative values
+  mutate(result = ifelse(parameter == "Phosphorus as P" & resultUnit == "ug/L", 
+                         result/1000, result), #unify units for P to mg/L
+         resultUnit = ifelse(parameter == "Phosphorus as P" & resultUnit == "ug/L", 
+                         "mg/L", resultUnit)) %>% #adjust units accordingly
+  filter(!(result == 982.00 & LAKENAME == "POWDERHORN")) %>% #remove one N outlier
+  
+  
+  #select columns of interest
+  mutate(sampleYear = year(sampleDate)) %>%
+  select(collectingOrg, gtlt, parameter, result, resultUnit, sampleDate, sampleYear, siteID, DOW)
+
+```
+
+Check that you've handled any problems with units by examining the following dataframe. There should only be one unit reported per parameter and that unit should be the same across parameters that represent similar analytes.
+
+```{r}
+unit_check <- MPCAOrg %>% 
+select(parameter, resultUnit) %>%
+group_by(parameter) %>%
+summarise(units = list(unique(resultUnit))) 
+```
+
+MULTI-BASIN ADJUSTMENTS
+
+Many metro lakes have multiple basins or are divided by roads/culverts. Usually the various basins are monitored separately, but we need to decide whether these should be treated like multiple monitoring stations on a single lake or treated as distinct lakes. The following decisions were made:
+
+Cornelia (27002800)
+  N (27002801) and S (27002802) basins will be combined under main lake DOW
+Sarah (27019100)
+  W (27019101) and E (27019102) basins will be combined under main lake DOW
+Shady Oak (27008900)
+  N (27008901) and Middle (27008902) bays will be combined under main lake DOW
+
+Marion (19002600)
+  Only use data from Marion East (19002601). Marion Middle (19002602) only has 3 data points from one year so it seems     unnecessary to average those into the more consistent East monitoring even though E and Middle are considered one lake.
+
+Whaletail
+  Separate N (27018401) and S (27018402) basins  
+Twin
+  Separate Upper (27004201), Middle (27004202), and Lower (27004203) basins
+Moore
+  Separate E (02007501) and W (02007502) basins
+Anderson
+  Separate NW (27006201), SE (27006202), and SW (27006203) basins
+Island
+  Separate N (62007502) and S (62007501) basins.
+Long
+  Separate N(62006701) and S (62006702) basins.
+Wilmes N (82009001) and S (82009002) 
+  Only one DOW but should be treated as separate lakes. Will be separated between site 201 and 202
+Forest W (82015901), Central (82015902), and E (82015903)
+  Only one DOW and these basins are fairly connected, but only the middle basin was treated with alum in 2023. For this reason I'm going to separate the basins based on their sampling site locations.
+  
+```{r}
+#Append identifiers to site IDs when combining DOWs in case each DOW has the same site #
+MPCAOrg1 <- MPCAOrg %>%
+  mutate(siteID = case_when(DOW == "27002801" ~ paste0(siteID, "N"),
+                            DOW == "27002802" ~ paste0(siteID, "S"),
+                            DOW == "27019101" ~ paste0(siteID, "W"),
+                            DOW == "27019102" ~ paste0(siteID, "E"),
+                            DOW == "27008901" ~ paste0(siteID, "N"),
+                            DOW == "27008902" ~ paste0(siteID, "M"),
+                            TRUE ~ siteID)) %>%
+  #merge DOWs for lakes that should be a single water body
+  mutate(DOW = case_when(DOW == "27002801" | DOW == "27002802" ~ "27002800",
+                         DOW == "27019101" | DOW == "27019102" ~ "27019100",
+                         DOW == "27008901" | DOW == "27008902" ~ "27008900",
+                            TRUE ~ DOW)) %>%
+  #remove Marion middle data
+  filter(DOW != "19002602") %>%
+  #separate Forest and Wilmes data by site
+   mutate(DOW = case_when(DOW == "82015900" & siteID == "201" ~ "82015901",
+                         DOW == "82015900" & siteID == "207" ~ "82015901",
+                         DOW == "82015900" & siteID == "205" ~ "82015901",
+                         DOW == "82015900" & siteID == "211" ~ "82015901",
+                         DOW == "82015900" & siteID == "206" ~ "82015901",
+                         
+                         DOW == "82015900" & siteID == "208" ~ "82015902",
+                         DOW == "82015900" & siteID == "209" ~ "82015902",
+                         DOW == "82015900" & siteID == "202" ~ "82015902",
+                         DOW == "82015900" & siteID == "100" ~ "82015902",
+                         
+                         DOW == "82015900" & siteID == "212" ~ "82015903",
+                         DOW == "82015900" & siteID == "203" ~ "82015903",
+                         DOW == "82015900" & siteID == "210" ~ "82015903",
+                         
+                         DOW == "82009000" & siteID == "201" ~ "82009001",
+                         DOW == "82009000" & siteID == "202" ~ "82009002",
+                            TRUE ~ DOW))
+  
+```
+
+DEDUPLICATION
+
+To begin filtering down to one measurement per lake per date, I'm going to pair down the secchi data. This is because secchi measurements can be reported as "> [max depth at sampling point]" if the water is clear to the bottom, and we don't want to average these if secchi was taken at two locations with different depths, where maybe it was clear to the bottom at the shallow location but an actual extinction depth is reported at the deeper location. We would just want the deepest measurement made on that day.
+
+First I'll average measurements by site on a given lake, in case more than one group went out on the same day. Then I'll select the deepest measurement across all sites to represent the lake for that day.
+
+Unfortunately through this process we're going to lose our collecting org info for the secchi measurements.
+
+```{r}
+#Split off secchi data
+  #calculate average if multiple samples were taken on the same site on the same day
+MPCA.Secchi <- MPCAOrg1 %>%
+  filter((parameter == "Depth, Secchi disk depth") | (parameter == "Secchi disc")) %>%
+  group_by(sampleDate, DOW, siteID, gtlt, sampleYear, resultUnit) %>%
+  summarise(result = mean(result)) %>%
+  ungroup() 
+
+  #check to see if any dates have values reported at the same site but where one is > and one isn't
+Secchi.dups <- MPCA.Secchi %>%
+  group_by(DOW, sampleDate, siteID) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+  #there are a few of these. Some of them (like Tanners) look like someone put in the wrong site information
+  #for example, 82011500 has samples for 101 and 201 in all other years, but duplicate 101 data in 2019
+  #this only impacts 18 samples so I'm going to assume they are all actually supposed to be separate sites and continue to the next step
+
+#Now remove site and select the deepest value for each lake on a given day
+MPCA.Secchi2 <- MPCA.Secchi %>%
+  select(-siteID) %>%
+  group_by(sampleDate, DOW, sampleYear) %>%
+  slice(which.max(result)) %>%
+  ungroup() %>%
+  mutate(collectingOrg = NA,
+         parameter = "secchi.m",
+         resultUnit = "m",
+         siteID = NA)
+
+#Remove secchi from original dataset
+MPCAOrg2 <- MPCAOrg1 %>%
+  filter((parameter != "Depth, Secchi disk depth") & (parameter != "Secchi disc")) 
+
+#Append filtered max secchi depths
+MPCAOrg3 <- rbind(MPCAOrg2, MPCA.Secchi2)
+```
+
+The same or similar analytes are reported under different parameter names. Here I unify the parameter names.
+
+```{r}
+MPCAepi <- MPCAOrg3 %>%
+  mutate(parameter = case_when(parameter == "Kjeldahl nitrogen as N" | 
+                                 parameter == "Kjeldahl Nitrogen, Total as N" |
+                                 parameter == "Nitrogen, total kjeldahl (TKN) as N" |
+                                 parameter == "Nitrogen, Total Kjeldahl (TKN) as N" ~ "TKN.mg_L",
+                               
+                               parameter == "Nitrogen as N" |
+                                 parameter == "Nitrogen, total as N" |
+                                 parameter == "Nitrogen, Total as N" |
+                                 parameter == "Nutrient-nitrogen as N" ~ "TN.mg_L",
+                                
+                               parameter == "Ammonia Nitrogen, Total as N" |
+                                 parameter == "Nitrogen, Ammonia as N" |
+                                 parameter == "Nitrogen, ammonia, as N as N" |
+                                 parameter == "Ammonia as N as N" |
+                                 parameter == "Ammonia-nitrogen as N" ~ "NH4.mg_L",
+                                                              
+                               parameter == "Inorganic nitrogen (nitrate and nitrite) as N" |
+                                 parameter == "Nitrate + Nitrite Nitrogen, Total as N" |
+                                 parameter == "Nitrate/Nitrite as N (N+N) as N" |
+                                 parameter == "Nitrate/Nitrite as N as N" ~ "DIN.mg_L",
+             
+                              parameter == "Nitrite as N" | parameter == "Nitrite as N as N"   ~ "nitrite.mg_L",
+                              parameter == "Nitrate as N" | parameter == "Nitrate as N as N" ~ "nitrate.mg_L",
+                               
+                               parameter == "Phosphorus as P" |
+                                 parameter == "Phosphorus, Total as P" |
+                                 parameter == "Phosphorus, Total as P as P" |
+                                 parameter == "Phosphorus, total as P as P" ~ "TP.mg_L",
+                               
+                              parameter == "Chlorophyll a, uncorrected for pheophytin" | 
+                                parameter == "Chlorophyll-A" |
+                                parameter == "Chlorophyll a - nonPC" ~ "chla.nonPcorr.ug_L",
+             
+                              parameter == "Chlorophyll a, corrected for pheophytin" |
+                                parameter == "Chlorophyll a" |
+                                parameter == "Chlorophyll a, pheophytin-adjusted" |
+                                parameter == "Chlorophyll-a, Pheophytin Corrected" |
+                                parameter == "Chlorophyll A" |
+                                parameter == "Chlorophyll-a" ~"chla.Pcorr.ug_L",
+  
+                               parameter == "Specific conductance" ~ "spCond.uS_cm", 
+                               parameter == "Chloride" ~ "Cl.mg_L",
+                              
+                              TRUE ~ parameter))
+
+
+```           
+
+Now we're going to handle de-duplication. There are several reasons something could be duplicated at this point:
+1) Samples from multiple organizations that went to the same site on the same day
+2) The same organization reporting multiple samples for one site
+3) Samples from multiple sites on the same lake on the same day (spatial survey)
+
+I'll start by averaging so there is a single value per site x lake x date
+Then I will average across sites so there is a single value per lake x date
+
+This is easier said than done because within a single spatial survey or multiple samples of the same site there could be some values that are above detection or below detection. I'm going to handle this problem in three steps.
+
+1) If the same result value is reported twice as both < and no flag, I will keep the value with a flag. It is not uncommon for samples at the detection to not be reported as such (~117 samples)
+2) Once this is handled, if there are a mix of result values and a mix of < and no flag I will use the detection limit as the value for averaging, but I will include a flag that indicates BDL values have been mixed in
+3) Finally, when I collapse the spatial surveys, I will do the same thing as step 2 and treat the detection limit as the value but flag the average value.
+
+```{r}
+
+
+#deduplicate any exact values that were reported multiple times (~2500 results)
+#also do step #1 of handling gtlt flags (~117 results)
+MPCAepi1 <- MPCAepi %>%
+  mutate(gtlt = case_when(gtlt == "< " ~ 1,
+                          gtlt == "> " ~ 100,
+                          is.na(gtlt) ~ 0)) %>%
+  group_by(DOW, sampleDate, sampleYear, parameter, siteID, result) %>%
+  slice(which.max(gtlt)) %>%
+  ungroup() 
+
+#now average multiple, unique results reported for the same site x lake x date
+MPCAepi2 <- MPCAepi1 %>%
+  group_by(DOW, sampleDate, sampleYear, parameter, siteID) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup() 
+
+#and finally collapse spatial surveys
+MPCAepi3 <- MPCAepi2 %>%
+  group_by(DOW, sampleDate, sampleYear, parameter) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#at the end of this 409 samples have been averaged with at least one BDL sample (out of 316,594, or ~0.1%)
+#These will be indicated by gtlt between 0 and 1
+#When using these data, this can be handled at one's own discretion
+
+#double check that you have one value per lake x date! Should return no duplicates
+  MPCAepi3 %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+```
+
+```{r}
+#save this version of the file, if desired
+MPCA <- MPCAepi3 %>%
+  mutate(dataSource = "MPCA")
+#write.csv(MPCA, file = "240521_MPCAtimeseriesEpiAvg.csv")
+```
+
+COMBINE WITH OTHER WMO DATA
+
+The MSP-LTER has received additional water quality data from city, county, and WMO entities that may or may not appear in the MCPA database. I will use that data to fill any gaps in unique lake x date monitoring events, but I will not be replacing or additionally averaging this data with any lake x date entries that already exist in the MPCA database
+
+```{r Ramsey Co}
+setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Data")
+
+# clean up Ramsey County dataset to match MPCA format
+RamseyCo <- read.xlsx("RamseyCoAllData.xlsx", detectDates = TRUE)
+RC2021 <- read.xlsx("RamseyCo2021.xlsx", detectDates = TRUE)
+RC2022 <- read.xlsx("RamseyCo2022alldata.xlsx", detectDates = TRUE)
+RC2023 <- read.xlsx("RamseyCo2023alldata.xlsx", detectDates = TRUE)
+
+RamseyCo1 <- RamseyCo %>% 
+  select(-ID) %>% 
+  mutate(`STRAT-M` = as.double(`STRAT-M`),
+         DATE = ymd(DATE),
+         gtlt_DIN.mg_L = if_else(`NO3N-MG/L` < 0.01, 1, 0), #using 2021 censor
+         gtlt_ammonia.mg_L = if_else(`NH3N-MG/L` < 0.04, 1, 0), #using 2021 censor
+         gtlt_TP.mg_L = if_else(`TP-MG/L` < 0.01, 1, 0), #using 2021 censor
+         gtlt_TKN.mg_L = if_else(!is.na(`TKN-MG/L`),0,NA), #no clear 2021 or 2022 censor
+         gtlt_chla.Pcorr.ug_L = if_else(`CCHLA-MG/M3` <= 1, 1, 0), #using a 2022 censor but this removes a lot of data???
+         gtlt_secchi.m = if_else(!is.na(`SEC-M`), 0,NA)) %>% #> censors would have to be site specific
+  mutate(`NO3N-MG/L` = if_else((gtlt_DIN.mg_L == 0 & !is.na(`NO3N-MG/L`)) 
+                               | is.na(`NO3N-MG/L`), 
+                            `NO3N-MG/L`, 0.01),
+         `NH3N-MG/L` = if_else((gtlt_ammonia.mg_L == 0 & !is.na(`NH3N-MG/L`)) 
+                                | is.na(`NH3N-MG/L`), 
+                                `NH3N-MG/L`, 0.04),
+         `TP-MG/L` = if_else((gtlt_TP.mg_L == 0 & !is.na(`TP-MG/L`)) 
+                             | is.na(`TP-MG/L`), 
+                           `TP-MG/L`, 0.01),
+         `CCHLA-MG/M3` = if_else((gtlt_chla.Pcorr.ug_L == 0 & !is.na(`CCHLA-MG/M3`)) 
+                                 | is.na(`CCHLA-MG/M3`), 
+                                 `CCHLA-MG/M3`, 1))
+
+RC2021_new <- RC2021 %>% 
+  mutate(`STRAT-M` = as.double(`STRAT-M`)) %>% 
+  mutate(gtlt_TP.mg_L = if_else(str_detect(`TP-MG/L`, "<"), 1, 0),
+         `TP-MG/L` = if_else(str_detect(`TP-MG/L`, "<"), 
+                             substr(`TP-MG/L`,2, nchar(`TP-MG/L`)), `TP-MG/L`),
+         gtlt_DIN.mg_L = if_else(str_detect(`NO3N-MG/L`, "<"), 1, 0),
+         `NO3N-MG/L` = if_else(str_detect(`NO3N-MG/L`, "<"), 
+                             substr(`NO3N-MG/L`,2, nchar(`NO3N-MG/L`)), `NO3N-MG/L`),
+         gtlt_ammonia.mg_L = if_else(str_detect(`NH3N-MG/L`, "<"), 1, 0),
+         `NH3N-MG/L` = if_else(str_detect(`NH3N-MG/L`, "<"), 
+                               substr(`NH3N-MG/L`,2, nchar(`NH3N-MG/L`)), `NH3N-MG/L`),
+         gtlt_secchi.m = if_else(str_detect(`SEC-M`, ">"), 100, 0),
+         `SEC-M` = if_else(str_detect(`SEC-M`, ">"), 
+                               substr(`SEC-M`,2, nchar(`SEC-M`)), `SEC-M`),
+         gtlt_TKN.mg_L = 0,
+         gtlt_chla.Pcorr.ug_L = 0,
+         Date = ymd(Date)) %>% 
+  mutate(`SEC-M` = as.numeric(`SEC-M`),
+         `TP-MG/L` = as.numeric(`TP-MG/L`),
+         `SRP-MG/L` = as.numeric(`SRP-MG/L`),
+         `NO3N-MG/L` = as.numeric(`NO3N-MG/L`),
+         `NH3N-MG/L` = as.numeric(`NH3N-MG/L`),
+         `CCHLA-MG/M3` = as.numeric(`CCHLA-MG/M3`),
+         `CL-MG/L` = as.numeric(`CL-MG/L`),
+         `TKN-MG/L` = as.numeric(`TKN-MG/L`)) %>%
+  rename(DATE = Date)
+
+RC2022_new <- RC2022 %>% 
+  mutate(`STRAT-M` = as.double(`STRAT-M`)) %>% 
+  rename(DATE = Date,
+          `Z-M` = Depth,
+          `TP-MG/L` = `Phosphorus,.Total.as.P`, 
+          `NO3N-MG/L` = `Nitrate/Nitrite.as.N.(N+N)`, 
+          `NH3N-MG/L` = `Ammonia.as.N`,
+          `TKN-MG/L` = `Nitrogen,.Total.Kjeldahl.(TKN)`,
+          `CCHLA-MG/M3` = `Chlorophyll-a,.Pheophytin.Corrected`,
+          `CL-MG/L` = `Chloride`) %>%
+  mutate(gtlt_TP.mg_L = if_else(str_detect(`TP-MG/L`, "&"), 1, 0),
+          `TP-MG/L` = if_else(str_detect(`TP-MG/L`, "&"), 
+                           substr(`TP-MG/L`,5, nchar(`TP-MG/L`)), `TP-MG/L`),
+        gtlt_DIN.mg_L = if_else(str_detect(`NO3N-MG/L`, "&"), 1, 0),
+       `NO3N-MG/L` = if_else(str_detect(`NO3N-MG/L`, "&"), 
+                             substr(`NO3N-MG/L`,5, nchar(`NO3N-MG/L`)), `NO3N-MG/L`),
+       gtlt_ammonia.mg_L = if_else(str_detect(`NH3N-MG/L`, "&"), 1, 0),
+       `NH3N-MG/L` = if_else(str_detect(`NH3N-MG/L`, "&"), 
+                             substr(`NH3N-MG/L`,5, nchar(`NH3N-MG/L`)), `NH3N-MG/L`),
+       gtlt_secchi.m = if_else(str_detect(`SEC-M`, "&"), 100, 0),
+       `SEC-M` = if_else(str_detect(`SEC-M`, "&"), 
+                             substr(`SEC-M`,5, nchar(`SEC-M`)), `SEC-M`),
+       gtlt_TKN.mg_L = if_else(!is.na(`TKN-MG/L`),0,NA),
+       gtlt_chla.Pcorr.ug_L = if_else(str_detect(`CCHLA-MG/M3`, "&"), 1, 0),
+       `CCHLA-MG/M3` = if_else(str_detect(`CCHLA-MG/M3`, "&"), 
+                             substr(`CCHLA-MG/M3`,5, nchar(`CCHLA-MG/M3`)), `CCHLA-MG/M3`),
+       DATE = ymd(DATE)) %>%
+  mutate(`SEC-M` = as.numeric(`SEC-M`),
+         `TP-MG/L` = as.numeric(`TP-MG/L`),
+         `NO3N-MG/L` = as.numeric(`NO3N-MG/L`),
+         `NH3N-MG/L` = as.numeric(`NH3N-MG/L`),
+         `CCHLA-MG/M3` = as.numeric(`CCHLA-MG/M3`),
+         `CL-MG/L` = as.numeric(`CL-MG/L`),
+         `TKN-MG/L` = as.numeric(`TKN-MG/L`))
+
+RC2023_new <- RC2023 %>% 
+  mutate(`STRAT-M` = as.double(`STRAT-M`)) %>% 
+  rename(DATE = Date,
+         `Z-M` = Depth,
+         `TP-MG/L` = `Phosphorus,.Total.as.P`, 
+         `NO3N-MG/L` = `Nitrate/Nitrite.as.N.(N+N)`, 
+         `NH3N-MG/L` = `Ammonia.as.N`,
+         `TKN-MG/L` = `Nitrogen,.Total.Kjeldahl.(TKN)`,
+         `CCHLA-MG/M3` = `Chlorophyll-a,.Pheophytin.Corrected`,
+         `CL-MG/L` = `Chloride`) %>%
+  mutate(gtlt_TP.mg_L = if_else(str_detect(`TP-MG/L`, "<"), 1, 0),
+         `TP-MG/L` = if_else(str_detect(`TP-MG/L`, "<"), 
+                             substr(`TP-MG/L`,2, nchar(`TP-MG/L`)), `TP-MG/L`),
+         gtlt_DIN.mg_L = if_else(str_detect(`NO3N-MG/L`, "<"), 1, 0),
+         `NO3N-MG/L` = if_else(str_detect(`NO3N-MG/L`, "<"), 
+                               substr(`NO3N-MG/L`,2, nchar(`NO3N-MG/L`)), `NO3N-MG/L`),
+         gtlt_ammonia.mg_L = if_else(str_detect(`NH3N-MG/L`, "<"), 1, 0),
+         `NH3N-MG/L` = if_else(str_detect(`NH3N-MG/L`, "<"), 
+                               substr(`NH3N-MG/L`,2, nchar(`NH3N-MG/L`)), `NH3N-MG/L`),
+         gtlt_secchi.m = if_else(str_detect(`SEC-M`, ">"), 100, 0),
+         `SEC-M` = if_else(str_detect(`SEC-M`, ">"), 
+                           substr(`SEC-M`,2, nchar(`SEC-M`)), `SEC-M`),
+         gtlt_chla.Pcorr.ug_L = if_else(str_detect(`CCHLA-MG/M3`, "<"), 100, 0),
+         `CCHLA-MG/M3` = if_else(str_detect(`CCHLA-MG/M3`, "<"), 
+                           substr(`CCHLA-MG/M3`,2, nchar(`CCHLA-MG/M3`)), `CCHLA-MG/M3`),
+         gtlt_TKN.mg_L = 0,
+        DATE = ymd(DATE)
+         ) %>%
+  mutate(`SEC-M` = as.numeric(`SEC-M`),
+         `TP-MG/L` = as.numeric(`TP-MG/L`),
+         `NO3N-MG/L` = as.numeric(`NO3N-MG/L`),
+         `NH3N-MG/L` = as.numeric(`NH3N-MG/L`),
+         `CCHLA-MG/M3` = as.numeric(`CCHLA-MG/M3`),
+         `CL-MG/L` = as.numeric(`CL-MG/L`),
+         `TKN-MG/L` = as.numeric(`TKN-MG/L`))
+
+
+RCcomplete <- bind_rows(RamseyCo1, RC2021_new, RC2022_new, RC2023_new)
+
+RCcomplete1 <- RCcomplete %>% 
+  mutate(DNRID = if_else(str_length(DNRID) == 14, str_sub(DNRID, start = 1, end = 10),
+                         DNRID),
+         DNRID = fixlakeid(DNRID),
+         DNRID = if_else(str_length(DNRID) == 6, str_c(DNRID, "00"), DNRID)) %>% 
+  select(LAKENAME, DNRID, DATE, SITE, `Z-M`, `TP-MG/L`, `CCHLA-MG/M3`, `SEC-M`, 
+         `SPCON-UMHOS`, `CL-MG/L`, `TKN-MG/L`, `NO3N-MG/L`, `NH3N-MG/L`,
+         gtlt_ammonia.mg_L, gtlt_DIN.mg_L, gtlt_TP.mg_L, gtlt_TKN.mg_L, 
+         gtlt_chla.Pcorr.ug_L, gtlt_secchi.m) %>% 
+  rename(DOW = DNRID, sampleDate = DATE, Depth = `Z-M`, result_TP.mg_L = `TP-MG/L`, 
+         result_chla.Pcorr.ug_L = `CCHLA-MG/M3`, result_secchi.m = `SEC-M`, result_spCond.uS_cm = `SPCON-UMHOS`,
+        result_Cl.mg_L = `CL-MG/L`, result_TKN.mg_L = `TKN-MG/L`, result_DIN.mg_L = `NO3N-MG/L`, 
+         result_NH4.mg_L = `NH3N-MG/L`, gtlt_NH4.mg_L = gtlt_ammonia.mg_L) %>% 
+  mutate(dataSource = "RamseyCo", sampleYear = year(sampleDate)) %>% 
+  mutate(DOW = ifelse(LAKENAME == "KELLER" | LAKENAME == "Keller", "62001002", DOW)) %>%
+  mutate(DOW = ifelse(LAKENAME == "OTTER" | LAKENAME == "Otter", "02000300", DOW)) %>%
+
+  #Long is treated as having separate N and S basins but I couldn't ID the location of site 5402  
+  mutate(DOW = ifelse(LAKENAME == "LONG" & (SITE == "201" | SITE == "5403"), "62006701", DOW)) %>%
+  mutate(DOW = ifelse((LAKENAME == "LONG" | LAKENAME == "Long") & (SITE == "202" | SITE == "5401"), "62006702", DOW)) %>%
+  mutate(DOW = ifelse(LAKENAME == "Long North" , "62006701", DOW)) %>%
+  mutate(DOW = ifelse(LAKENAME == "Long South" , "62006702", DOW)) %>%
+  mutate(DOW = ifelse(LAKENAME == "LONG" & SITE == "5402", NA, DOW))%>%
+  
+  #Some sites for Island are associated with the broader DOW (62007500) but I can't determine whether those sites are in N Island or S Island so I've excluded the sites I can't locate for now
+  mutate(DOW = ifelse(LAKENAME == "ISLAND" & SITE == "5404", "62007502", DOW)) %>%
+  mutate(DOW = ifelse(LAKENAME == "ISLAND" & SITE == "5402", "62007501", DOW)) %>%
+  mutate(DOW = ifelse((DOW == "62007500") 
+                      & (SITE == "5401" | SITE == "5403" | SITE == "202"), NA , DOW)) %>%
+  filter(!is.na(DOW)) %>%
+  select(-LAKENAME)%>%
+  relocate(sampleYear, .after = sampleDate)
+
+
+####Pivot longer and filter for surface samples####
+RCLong <- RCcomplete1 %>%
+  pivot_longer(cols = c(starts_with("result"), starts_with("gtlt")),
+     names_to = c(".value","parameter"),
+     names_pattern = '(.*?)_(.*)') %>%
+  filter(!is.na(result)) %>%
+  mutate(gtlt = if_else(is.na(gtlt),0,gtlt)) %>%
+
+ #slice out the most shallow value from any profiles taken
+      #Note that this returns all rows that have the min sampleDepth so there might be multiple rows per site/date
+      #This is usually because two different groups took a surface sample at the same site on the same day
+      #These will be averaged out later
+  rowwise() %>%
+  group_by(DOW, sampleDate, SITE, parameter) %>% 
+  filter(Depth == min(Depth)) %>%
+  ungroup() %>%
+  
+  #filter for only surface samples
+  filter(Depth <= 2) %>%
+  select(-Depth)
+  
+####follow the same deduplication methods for MPCA####
+
+#Split off secchi data
+  #calculate average if multiple samples were taken on the same site on the same day
+RC.Secchi <- RCLong %>%
+  filter(parameter == "secchi.m") %>%
+  group_by(sampleDate, DOW, SITE, gtlt, sampleYear, dataSource, parameter) %>%
+  summarise(result = mean(result)) %>%
+  ungroup() 
+
+#Now remove site and select the deepest value for each lake on a given day
+RC.Secchi2 <- RC.Secchi %>%
+  select(-SITE) %>%
+  group_by(sampleDate, DOW, sampleYear, parameter, dataSource) %>%
+  slice(which.max(result)) %>%
+  ungroup() %>%
+  mutate(SITE = NA)
+
+#Remove secchi from original dataset
+RCLong2 <- RCLong %>%
+  filter(parameter != "secchi.m")
+
+#Append filtered max secchi depths
+RCLong3 <- rbind(RCLong2, RC.Secchi2)
+
+
+  
+#deduplicate any exact values that were reported multiple times (~2500 results)
+#also do step #1 of handling gtlt flags (~117 results)
+RCLong4 <- RCLong3 %>%
+  group_by(DOW, sampleDate, sampleYear, parameter, SITE, result, dataSource) %>%
+  slice(which.max(gtlt)) %>%
+  ungroup() %>%
+
+#now average multiple, unique results reported for the same site x lake x date
+  group_by(DOW, sampleDate, sampleYear, parameter, SITE, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup() %>%
+
+#and finally collapse spatial surveys
+  group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#at the end of this 431 samples have been averaged with at least one BDL sample
+#These will be indicated by gtlt between 0 and 1
+#When using these data, this can be handled at one's own discretion
+
+#double check that you have one value per lake x date! Should return no duplicates
+  RCLong4 %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+# Add Ramsey Co data to MPCA if the lake x date isn't already represented
+  
+RC_new <- anti_join(RCLong4,MPCA, by = c("DOW", "sampleDate", "sampleYear", "parameter"))
+MPCA_RC <- bind_rows(MPCA,RC_new)
+
+
+#double check for any lake x date x parameter duplicates
+  MPCA_RC %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+  
+```
+
+
+```{r South Washington Watershed District}
+setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Data")
+# clean SWWD
+#The file I am loading in is slightly different fromt the file we recieved directly from SWWD
+#I manually fixed a problem with the DOW of Powers and Markgraf lakes in the SWWDLakes.csv file
+#manually fixed a typo for Fish DOW (orignially listed as 82012300 for 2 data points)
+
+#Wilmes is reported here as 82009000 but I believe every sample marked as that is actually 82009001
+      #If it's 82009002 it's recorded as such
+#I'm believe they're sampling the south portion of Armstrong because that's the only portion with data on MPCA
+      #Therefore it should be 82011602
+
+#SWWD data doesn't have censor/detection limit indications
+#There isn't a ton of data that jumps out that it should be censored
+  #possibly some of the uncorrected chla data
+#For now we just have to make the assumption it's all uncensored
+
+#The lake site parameter is uninformative (either NA or 451) so it is dropped
+SWWD <- read.csv("SWWDLakes.csv") %>% 
+  select(-X)
+ 
+SWWD1 <- SWWD %>% 
+  select(DNR.Number, Date, Secchi.Depth..m., Chloride..mg.l., Phosphorus.as.P..mg.l.,
+         Chlorophyll.a..uncorrected.for.pheophytin..µg.L., Kjeldahl.nitrogen..mg.l.,
+         Chlorophyll.a..Pheo.Corrected..µg.L., Depth) %>% 
+  rename(chla.nonPcorr.ug_L = Chlorophyll.a..uncorrected.for.pheophytin..µg.L., 
+         chla.Pcorr.ug_L = Chlorophyll.a..Pheo.Corrected..µg.L.,
+         DOW = DNR.Number, secchi.m = Secchi.Depth..m., Cl.mg_L = Chloride..mg.l., 
+         TP.mg_L = Phosphorus.as.P..mg.l., TKN.mg_L = Kjeldahl.nitrogen..mg.l.) %>% 
+  mutate(Date1 = str_split_fixed(Date, " ", 2)[,1]) %>%
+  mutate(Date = mdy(Date1)) %>% 
+  rename(sampleDate = Date) %>%
+  mutate(sampleYear = year(sampleDate)) %>%
+  select(-Date1) %>% 
+  mutate(dataSource = "SWWD",
+         DOW = fixlakeid(DOW)) %>% 
+  mutate(DOW = if_else(DOW == "82009000", "82009001", DOW),
+         DOW = if_else(DOW == "82011600", "82011602", DOW))
+
+
+####Pivot longer and filter for surface samples####
+SWWDLong <- SWWD1 %>%
+  pivot_longer(cols = c("secchi.m", "Cl.mg_L", "TP.mg_L" , "chla.nonPcorr.ug_L", "TKN.mg_L","chla.Pcorr.ug_L"),
+     names_to = ("parameter")) %>%
+  rename(result = value) %>%
+  filter(!is.na(result)) %>%
+  mutate(gtlt = 0) %>%
+
+ #slice out the most shallow value from any profiles taken
+      #Note that this returns all rows that have the min sampleDepth so there might be multiple rows per site/date
+      #This is usually because two different groups took a surface sample at the same site on the same day
+      #These will be averaged out later
+  rowwise() %>%
+  group_by(DOW, sampleDate, parameter) %>% 
+  filter(Depth == min(Depth)) %>%
+  ungroup() %>%
+  
+  #filter for only surface samples
+  filter(Depth <= 2) %>%
+  select(-Depth) %>%
+
+#because there are not multiple sites we don't have to collapse spatial surveys and we can just average any duplicate reports
+  group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#double check that you have one value per lake x date! Should return no duplicates
+  SWWDLong %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+# Add SWWD data to MPCA if the lake x date isn't already represented
+  
+SWWD_new <- anti_join(SWWDLong,MPCA_RC, by = c("DOW", "sampleDate", "sampleYear", "parameter"))
+MPCA_RC_SWWD <- bind_rows(MPCA_RC,SWWD_new)
+
+
+#double check for any lake x date x parameter duplicates
+  MPCA_RC_SWWD %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+```
+
+
+```{r Carver County Water Management}
+setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Data")
+
+# manually added DOW data to these files with an index match from MetroLakes3
+# manually fixed a typo for lake name "Miller" on 2020-05-06
+# CCWMO does not have any censor flagging, so idk if anything is censored
+  # The TP data seems really really low
+CCWMO <- read.csv("CCWMO_LakeData.csv")
+CCWMOchloride <- read.csv("CCWMOchloride.csv")
+
+CCWMOchlor1 <- CCWMOchloride %>% 
+  select(Date, Month, Year, Depth..m., CL...mg.L., DOW) %>% 
+  filter(Depth..m. == 1) %>%
+  select(-Depth..m.)
+
+CCWMOall2 <- bind_rows(CCWMO, CCWMOchlor1) %>% 
+  select(-Season, -Month, -Year, -N.P.Ratio, -TSS..mg.L., -Lake) %>% 
+  rename(TP.mg_L = TP..mg.L., secchi.m = Secchi..m., chla.Pcorr.ug_L = CLA..ug.L.,
+         Cl.mg_L = CL...mg.L., TKN.mg_L = TKN..mg.L.) %>% 
+  mutate(Date = mdy(Date), Date = ymd(Date)) %>% 
+  rename(sampleDate = Date) %>% 
+  mutate(sampleYear = year(sampleDate)) %>%
+  select(-TP..ug.L.) %>% 
+  filter(!is.na(DOW)) %>%
+  mutate(chla.Pcorr.ug_L = as.numeric(chla.Pcorr.ug_L), 
+         DOW = as.character(DOW),
+         dataSource = "CCWMO")
+
+####Pivot longer and filter for surface samples####
+CCWMOLong <- CCWMOall2 %>%
+  pivot_longer(cols = c("TP.mg_L","TKN.mg_L","secchi.m","chla.Pcorr.ug_L","Cl.mg_L"),
+     names_to = ("parameter")) %>%
+  rename(result = value) %>%
+  filter(!is.na(result)) %>%
+  mutate(gtlt = 0) %>%
+
+ #No sample depths, assume it's all surface
+
+#because there are not multiple sites we don't have to collapse spatial surveys and we can just average any duplicate reports
+  group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#double check that you have one value per lake x date! Should return no duplicates
+  CCWMOLong %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+# Add SWWD data to MPCA if the lake x date isn't already represented
+  
+CCWMO_new <- anti_join(CCWMOLong,MPCA_RC_SWWD, by = c("DOW", "sampleDate", "sampleYear", "parameter"))
+MPCA_RC_SWWD_CCWMO <- bind_rows(MPCA_RC_SWWD,CCWMO_new)
+
+
+#double check for any lake x date x parameter duplicates
+  MPCA_RC_SWWD_CCWMO %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+```
+
+
+```{r Riley Purgatory Bluff Creek}
+setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Data")
+
+# RPBCWD data cleaning
+RPBCWD <- read.csv("RPBCWDlakeData.csv")
+
+#check the various units each chemical parameter is reported in
+UnitTest <- RPBCWD %>% 
+  filter(CHEMICAL_NAME == "Chlorophyll a, pheophytin-adjusted")
+unique(UnitTest$RESULT_UNIT)
+
+# 2013 Mitchell, Riley, Round lake chl-a pheo-corr values have wrong units of mg/L. Data is on the order of magnitude of ug/L. mistake by RPBCWD? Have treated data like it's ug/L.
+
+# I also don't know if samples labeled as "Chlorophyll a" are corrected or uncorrected so I'm leaving them out
+
+RPBCWD1 <- RPBCWD %>% 
+  select(SYS_LOC_CODE, SAMPLE_DATE, START_DEPTH, DEPTH_UNIT, CHEMICAL_NAME,
+         RESULT_UNIT, NEW_report_result_text) %>%
+  mutate(gtlt = if_else(str_detect(NEW_report_result_text, "<"), 1, 0),
+         NEW_report_result_text = if_else(str_detect(NEW_report_result_text, "<"), 
+      substr(NEW_report_result_text,3, nchar(NEW_report_result_text)), 
+      NEW_report_result_text),
+      NEW_report_result_text = as.numeric(NEW_report_result_text)) %>%
+  rename(LAKENAME = SYS_LOC_CODE, sampleDate = SAMPLE_DATE) %>% 
+  mutate(LAKENAME = if_else(str_detect(LAKENAME, "_"), gsub("_", " ", LAKENAME), LAKENAME),
+         LAKENAME = toupper(LAKENAME)) %>% 
+  mutate(DEPTH.M = if_else(condition = DEPTH_UNIT == "ft", true = START_DEPTH/3.281, 
+                           false = START_DEPTH)) %>% 
+  select(-START_DEPTH, -DEPTH_UNIT) %>%
+  
+  mutate(sampleDate = mdy(sampleDate)) %>% 
+  filter((CHEMICAL_NAME == "Secchi disc") | (CHEMICAL_NAME == "Phosphorus, total, as P") | 
+           (CHEMICAL_NAME == "Chlorophyll a, not pheophytin-adjusted") | 
+           (CHEMICAL_NAME == "Chlorophyll a, pheophytin-adjusted") |
+           (CHEMICAL_NAME == "Specific conductance @ 25 ºC") | 
+           (CHEMICAL_NAME == "Nitrogen, total") | (CHEMICAL_NAME == "Chloride") |
+           (CHEMICAL_NAME == "Nitrogen, total kjeldahl (TKN)") |
+           (CHEMICAL_NAME == "Nitrogen, nitrate, as N") |
+           (CHEMICAL_NAME == "Nitrogen, nitrite, as N") |
+           (CHEMICAL_NAME == "Nitrogen, nitrate + nitrite, as N") |
+           (CHEMICAL_NAME == "Nitrogen, ammonia, as N")) %>% 
+  mutate(result = case_when(RESULT_UNIT == "ft" ~ NEW_report_result_text/3.281,
+                                     RESULT_UNIT == "mmhos/cm" ~ NEW_report_result_text*1000,
+                                     RESULT_UNIT == "ug/l" & CHEMICAL_NAME == 
+                                       "Phosphorus, total, as P" ~ NEW_report_result_text/1000,
+                                     TRUE ~ NEW_report_result_text)) %>% 
+  filter(RESULT_UNIT != "%",
+         !is.na(result)) %>%
+  select(-NEW_report_result_text, -RESULT_UNIT) %>%
+
+#slice out the most shallow value from any profiles taken
+      #Note that this returns all rows that have the min sampleDepth so there might be multiple rows per site/date
+      #These will be averaged out later
+  rowwise() %>%
+  group_by(LAKENAME, sampleDate, CHEMICAL_NAME) %>% 
+  filter(DEPTH.M == min(DEPTH.M)) %>%
+  ungroup() %>%
+  
+  #filter for only surface samples
+  filter(DEPTH.M <= 2) %>%
+  select(-DEPTH.M) %>%
+  
+#rename everything to match
+  rename(parameter = CHEMICAL_NAME) %>%
+  mutate(parameter = case_when(parameter == "Secchi disc" ~ "secchi.m",
+                               parameter == "Chlorophyll a, not pheophytin-adjusted" ~ "chla.nonPcorr.ug_L",
+                               parameter == "Phosphorus, total, as P" ~ "TP.mg_L",
+                               parameter == "Specific conductance @ 25 ºC" ~ "spCond.uS_cm",
+                               parameter == "Nitrogen, total" ~ "TN.mg_L",
+                               parameter == "Nitrogen, total kjeldahl (TKN)" ~ "TKN.mg_L",
+                               parameter == "Chlorophyll a, pheophytin-adjusted" ~ "chla.Pcorr.ug_L",
+                               parameter == "Nitrogen, nitrate + nitrite, as N" ~ "DIN.mg_L",
+                               parameter == "Nitrogen, nitrate, as N" ~ "nitrate.mg_L",
+                               parameter == "Nitrogen, nitrite, as N" ~ "nitrite.mg_L",
+                               parameter == "Nitrogen, ammonia, as N" ~ "NH4.mg_L",
+                               parameter == "Chloride" ~ "Cl.mg_L")) %>%
+  mutate(DOW = case_when(LAKENAME == "SUSAN" ~ 10001300,
+                         LAKENAME == "STARING" ~ 27007800,
+                         LAKENAME == "DUCK LAKE" ~ 27006900,
+                         LAKENAME == "RILEY" ~ 10000200,
+                         LAKENAME == "LUCY" ~ 10000700,
+                         LAKENAME == "ANN" ~ 10001200,
+                         LAKENAME == "LOTUS" ~ 10000600,
+                         LAKENAME == "RED ROCK" ~ 27007600,
+                         LAKENAME == "MITCHELL" ~ 27007000,
+                         LAKENAME == "ROUND" ~ 27007100,
+                         LAKENAME == "RICE MARSH" ~ 10000100,
+                         LAKENAME == "SILVER" ~ 27013600,
+                         LAKENAME == "IDLEWILD" ~ 27007400,
+                         LAKENAME == "HYLAND-MIDDLE" ~ 27004800,
+                         LAKENAME == "MCCOY" ~ 27007700)) %>%
+      mutate(DOW = as.character(DOW),
+              sampleYear = year(sampleDate),
+             dataSource = "RPBCWD") %>%
+    select(-LAKENAME)
+
+#There are a lot of duplicate date/lake/parameter reports. 
+#Unsure if these is multiple sites that aren't differentiated or multiple depths or...
+#Will average as though it's multiple samples at the same site.
+
+#because there are not multiple sites we don't have to collapse spatial surveys and we can just average any duplicate reports
+  RPBCWDLong <- RPBCWD1 %>%
+  group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#double check that you have one value per lake x date! Should return no duplicates
+  RPBCWDLong %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+# Add RPBCWD data to MPCA if the lake x date isn't already represented
+  
+RPBCWD_new <- anti_join(RPBCWDLong,MPCA_RC_SWWD_CCWMO, by = c("DOW", "sampleDate", "sampleYear", "parameter"))
+MPCA_RC_SWWD_CCWMO_RPBCWD <- bind_rows(MPCA_RC_SWWD_CCWMO,RPBCWD_new)
+
+
+#double check for any lake x date x parameter duplicates
+  MPCA_RC_SWWD_CCWMO_RPBCWD %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+        
+```
+
+```{r MCES}
+setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Data")
+# Add MCES data to Timeseries set
+MCESall <- read.csv("Timeseries_AllLakes_MCES.csv")
+
+#remove all data labeled as "suspect." 
+#There is still "Preliminary" data in here which is one secchi and many "physical condition"
+MCESall <- filter(MCESall, QUALIFIER != "Suspect")
+
+# note - did not include TP or TKN 'filtered' data
+    #There are essentially no TKN filtered surface samples
+    #and every surface filtered TP sample is paired with an unfiltered sample
+MCESclean <- MCESall %>% 
+  select(STATION_ID, SAMPLE_DEPTH_m, START_DATE_TIME, PARAMETER, SIGN,
+         RESULT) %>% 
+  mutate(DOW = str_sub(STATION_ID, start = 1, end = 8),
+         SITE = str_sub(STATION_ID, start = 10, end = 11)) %>% 
+  select(-STATION_ID) %>% 
+  mutate(START_DATE_TIME = mdy_hm(START_DATE_TIME),
+         sampleDate = str_split_fixed(START_DATE_TIME, " ", 2)[ ,1]) %>% 
+  select(-START_DATE_TIME) %>% 
+  mutate(sampleDate = ymd(sampleDate),
+         dataSource = "MCES") %>% 
+  
+#fix DOWs for multibasin lakes
+  mutate(DOW = case_when(DOW == "27002802" ~ "27002800",
+                         DOW == "27008902" ~ "27008900",
+                         DOW == "82015900" & SITE == "01" ~ "82015901",
+                         DOW == "82015900" & SITE == "02" ~ "82015902",
+                         DOW == "82015900" & SITE == "03" ~ "82015903",
+                         TRUE ~ DOW)) %>%
+  filter(DOW != "82015900") %>%
+  
+  
+#select parameters of interest
+  filter(PARAMETER == "Conductivity" |
+           PARAMETER == "Secchi Depth" |
+           PARAMETER == "Total Phosphorus, Unfiltered, Low Level Detection" |
+           PARAMETER == "Total Phosphorus, Unfiltered" | #no surface samples
+           PARAMETER == "Total Kjeldahl Nitrogen, Unfiltered, Low Level Detection" |
+           PARAMETER == "Total Kjeldahl Nitrogen, Unfiltered" | #three surface samples
+           PARAMETER == "Chloride, Unfiltered" |
+           PARAMETER == "Chlorophyll-a Trichromatic Uncorrected" |
+           PARAMETER == "Chlorophyll-a, Pheo-Corrected" |
+           PARAMETER == "Ammonia Nitrogen, Unfiltered" |
+           PARAMETER == "Nitrate N, Unfiltered" |
+           PARAMETER == "Nitrite N, Unfiltered" |
+           PARAMETER == "Total Nitrate/Nitrite N, Unfiltered") %>% 
+  mutate(sampleYear = year(sampleDate),
+         gtlt = if_else(SIGN == "<",1,0),
+         gtlt = if_else(SIGN == "+" | SIGN == ">",100,gtlt),
+         PARAMETER = if_else(PARAMETER == "Total Kjeldahl Nitrogen, Unfiltered",
+                      "Total Kjeldahl Nitrogen, Unfiltered, Low Level Detection",
+                      PARAMETER)) %>% 
+  select(-SIGN) %>%
+  filter(!is.na(RESULT)) %>%
+  
+  rename(parameter = PARAMETER) %>%
+  mutate(parameter = case_when(parameter == "Secchi Depth" ~ "secchi.m",
+                            parameter == "Chlorophyll-a Trichromatic Uncorrected" ~ "chla.nonPcorr.ug_L",
+                            parameter == "Total Phosphorus, Unfiltered, Low Level Detection" ~ "TP.mg_L",
+                            parameter == "Total Phosphorus, Unfiltered" ~ "TP.mg_L",
+                               parameter == "Conductivity" ~ "spCond.uS_cm",
+                            parameter == "Total Kjeldahl Nitrogen, Unfiltered, Low Level Detection" ~ "TKN.mg_L",
+                            parameter == "Total Kjeldahl Nitrogen, Unfiltered" ~ "TKN.mg_L",
+                            parameter == "Chlorophyll-a, Pheo-Corrected" ~ "chla.Pcorr.ug_L",
+                            parameter == "Total Nitrate/Nitrite N, Unfiltered" ~ "DIN.mg_L",
+                            parameter == "Nitrate N, Unfiltered" ~ "nitrate.mg_L",
+                            parameter == "Nitrite N, Unfiltered" ~ "nitrite.mg_L",
+                            parameter == "Ammonia Nitrogen, Unfiltered" ~ "NH4.mg_L",
+                             parameter == "Chloride, Unfiltered" ~ "Cl.mg_L")) %>%
+
+  mutate(RESULT = if_else(parameter == "chla.nonPcorr.ug_L", RESULT*1000, RESULT),
+         RESULT = if_else(parameter == "chla.Pcorr.ug_L", RESULT*1000, RESULT),
+         dataSource = "MCES") %>%
+  rename(result = RESULT) %>%
+    
+    #slice out the most shallow value from any profiles taken
+      #Note that this returns all rows that have the min sampleDepth so there might be multiple rows per site/date
+      #These will be averaged out later
+  rowwise() %>%
+  group_by(DOW, sampleDate, parameter, SITE, dataSource) %>% 
+  filter(SAMPLE_DEPTH_m == min(SAMPLE_DEPTH_m)) %>%
+  ungroup() %>%
+  
+  #filter for only surface samples
+  filter(SAMPLE_DEPTH_m <= 2) %>%
+  select(-SAMPLE_DEPTH_m)
+
+#DEDUPLICATION  
+  #average multiple, unique results reported for the same site x lake x date
+MCESLong <- MCESclean %>%
+  group_by(DOW, sampleDate, sampleYear, parameter, SITE, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup() %>%
+
+#collapse spatial surveys
+  group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#double check that you have one value per lake x date! Should return no duplicates
+  MCESLong %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+# Add MCES data to MPCA if the lake x date isn't already represented
+MCES_new <- anti_join(MCESLong,MPCA_RC_SWWD_CCWMO_RPBCWD, by = c("DOW", "sampleDate", "sampleYear", "parameter"))
+MPCA_RC_SWWD_CCWMO_RPBCWD_MCES <- bind_rows(MPCA_RC_SWWD_CCWMO_RPBCWD,MCES_new)
+
+
+#double check for any lake x date x parameter duplicates
+  MPCA_RC_SWWD_CCWMO_RPBCWD_MCES %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+  
+```
+
+```{r Anoka county}
+setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Data/ACD")
+
+#ACD doesn't report any censor levels, sampling depths, or sampling sites
+
+Coon <- read.csv("CoonLakeEastBay_02004200_ACD.csv") %>% 
+  mutate(LAKENAME = "COON", DOW = "02004200") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Crooked <- read.csv("Crooked_02008400_ACD.csv") %>% 
+  mutate(LAKENAME = "CROOKED", DOW = "02008400") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+EastMoore <- read.csv("EastMoore_02007501_ACD.csv") %>% 
+  mutate(LAKENAME = "EAST MOORE", DOW = "02007501") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+EastTwin <- read.csv("EastTwin_02013300_ACD.csv") %>% 
+  mutate(LAKENAME = "EAST TWIN", DOW = "02013300") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Fawn <- read.csv("Fawn_02003500_ACD.csv") %>% 
+  mutate(LAKENAME = "FAWN", DOW = "02003500") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+George <- read.csv("George_02009100_ACD.csv") %>% 
+  mutate(LAKENAME = "GEORGE", DOW = "02009100") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Ham <- read.csv("Ham_02005300_ACD.csv") %>% 
+  mutate(LAKENAME = "HAM", DOW = "02005300") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Laddie <- read.csv("Laddie_02007200_ACD.csv") %>% 
+  mutate(LAKENAME = "LADDIE", DOW = "02007200") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Linwood <- read.csv("Linwood_02002600_ACD.csv") %>% 
+  mutate(LAKENAME = "LINWOOD", DOW = "02002600") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Martin <- read.csv("Martin_02003400_ACD.csv") %>% 
+  mutate(LAKENAME = "MARTIN", DOW = "02003400") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Netta <- read.csv("Netta_02005200_ACD.csv") %>% 
+  mutate(LAKENAME = "NETTA", DOW = "02005200") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Pickerel <- read.csv("Pickerel_02013000_ACD.csv") %>% 
+  mutate(LAKENAME = "PICKEREL", DOW = "02013000") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Reshanau <- read.csv("Reshanau_02000900_ACD.csv") %>% 
+  mutate(LAKENAME = "RESHANAU", DOW = "02000900") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Round <- read.csv("Round_02008900_ACD.csv") %>% 
+  mutate(LAKENAME = "ROUND", DOW = "02008900") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+Typo <- read.csv("Typo_30000900_ACD.csv") %>% 
+  mutate(LAKENAME = "TYPO", DOW = "30000900") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+WestMoore <- read.csv("WestMoore_02007502_ACD.csv") %>% 
+  mutate(LAKENAME = "WEST MOORE", DOW = "02007502") %>% 
+  relocate(LAKENAME, DOW, .before = Date)
+
+# join all anoka cons dist csv files together
+ACD <- rbind(Coon, Crooked, EastMoore, EastTwin, Fawn, George, Ham, Laddie, 
+             Linwood, Martin, Netta, Pickerel, Reshanau, Round, Typo, WestMoore)
+
+# clean joined ACD file
+ACD1 <- ACD %>% 
+  select(-X, -LAKENAME) %>% 
+  mutate(Date = str_sub(Date, start = 1, end = 7), Date = mdy(Date)) %>% 
+  select(-DO..mg.L., -pH, -Secchi.tube..cm., -TSS..mg.L., -Turb..FNRU., -Cl..mg.L.) %>% 
+  rename(TP.ug_L = TP..ug.L., chla.nonPcorr.ug_L = Chl.a..ug.L.,  
+         spCond.uS_cm = Cond..mS.cm., secchi.m = Secchi..ft., sampleDate = Date) %>% 
+  mutate(TP.mg_L = TP.ug_L/1000) %>% 
+  select(-TP.ug_L) %>% 
+  mutate(spCond.uS_cm = as.numeric(spCond.uS_cm)*1000) %>%
+  mutate(secchi.m = as.numeric(secchi.m)*0.305) %>%
+  mutate(dataSource = "ACD",
+         sampleYear = year(sampleDate))
+
+####Pivot longer and filter for surface samples####
+ACDLong <- ACD1 %>%
+  pivot_longer(cols = c("secchi.m", "spCond.uS_cm", "TP.mg_L" , "chla.nonPcorr.ug_L"),
+     names_to = ("parameter")) %>%
+  rename(result = value) %>%
+  filter(!is.na(result)) %>%
+  mutate(gtlt = 0) %>%
+
+ #no depths reported, assume surface
+#because there are not multiple sites we don't have to collapse spatial surveys and we can just average any duplicate reports
+  group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#double check that you have one value per lake x date! Should return no duplicates
+  ACDLong %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+# Add ACD data to MPCA if the lake x date isn't already represented
+ACD_new <- anti_join(ACDLong,MPCA_RC_SWWD_CCWMO_RPBCWD_MCES, by = c("DOW", "sampleDate", "sampleYear", "parameter"))
+MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD <- bind_rows(MPCA_RC_SWWD_CCWMO_RPBCWD_MCES,ACD_new)
+
+
+#double check for any lake x date x parameter duplicates
+  MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+```
+
+
+```{r Eagan}
+setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Data")
+
+# read in Eagan dataset
+Eagan <- read.csv("City_of_Eagan_WQDataset_Priority.csv") 
+Eagan1 <- Eagan %>% 
+  mutate(Common.name = case_when(Common.name == "Blackhawk W 1day POST ALUM" ~ "Blackhawk W",
+                                 Common.name == "Blackhawk W 7days POST ALUM" ~ "Blackhawk W",
+                                 Common.name == "Gravel Pit " ~ "Gravel Pit",
+                                 Common.name == "Gravel Pit grab sample at outfall" ~ "Gravel Pit",
+                                 Common.name == "Almquist " ~ "Almquist",
+                                 Common.name == "Bur Oaks " ~ "Bur Oaks",
+                                 Common.name == "Heine " ~ "Heine",
+                                 Common.name == "Mooney " ~ "Mooney",
+                                 Common.name == "Heine " ~ "Heine",
+                                 TRUE ~ Common.name)) %>% 
+  filter((Common.name != "3174") & (Common.name != ".")) 
+
+EaganDOWs <- read.csv("Eagan_Lake_DOWs.csv")
+
+EaganJoin <- left_join(Eagan1, EaganDOWs, by = c("Common.name" = "LAKENAME")) %>% 
+  relocate(DOW, .after = Common.name)
+
+DOW_check <- EaganJoin %>%
+  group_by(DOW, Common.name) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+#separate corrected and uncorrected chla values
+Eagan2 <- EaganJoin %>%
+  rename(corr = corr..for.pheophytin) %>%
+  mutate(sampleDate = mdy(Date), sampleYear = year(sampleDate)) %>%
+  mutate(chla.Pcorr.ug_L = case_when(corr == "yes" ~ Chl.a..µg.L.,
+                                     corr == "corrected for pheophytin " ~ Chl.a..µg.L.,
+                                     corr == "corrected for pheophytin" ~ Chl.a..µg.L.,
+                                     corr == "corrected for pheophtyin" ~ Chl.a..µg.L.,
+                                     corr == "Corrected for pheophytin" ~ Chl.a..µg.L.,
+                                     corr == "Corrected for pheophytin (uncorrected value is 16 ug/L)" ~ Chl.a..µg.L.,
+                                     corr == "Corrected" ~ Chl.a..µg.L.,
+                                     corr == "Corrected for pheophytin (uncorrected value is 49 ug/L)" ~ Chl.a..µg.L.,
+                                     (corr == "" & sampleYear >= 2011) ~ Chl.a..µg.L.)) %>%
+  mutate(chla.nonPcorr.ug_L = case_when(corr == "no" ~ Chl.a..µg.L.,
+                                     corr == "uncorrected for pheophytin" ~ Chl.a..µg.L.,
+                                     corr == "None" ~ Chl.a..µg.L.,
+                                     (corr == "" & sampleYear <= 2010) ~ Chl.a..µg.L.))
+
+
+#pull only columns we want
+Cleangan <- Eagan2 %>% 
+  select(DOW, sampleDate, sampleYear, Secchi..m., Total.P.surface..mg.L., TP.surface.note, 
+         Chloride.Surface..mg.L., SD.note..water.color,
+         Conduc.surface..mS.cm., Total.Kjeldahl.N..mg.L., Kjeldahl.N.note, 
+         chla.Pcorr.ug_L, chla.nonPcorr.ug_L, 
+         NOX..mg.L., NOX.note, Chlor.a.note) %>% 
+ # mutate_all(function(x) ifelse(x == "NR",NA,x)) %>%
+  mutate(result_spCond.uS_cm = as.numeric(Conduc.surface..mS.cm.)*1000,
+         gtlt_spCond.uS_cm = if_else(!is.na(result_spCond.uS_cm), 0, NA),
+         result_Cl.mg_L = ifelse(Chloride.Surface..mg.L. == "NS", 
+                                          NA, as.numeric(Chloride.Surface..mg.L.)),
+         gtlt_Cl.mg_L = if_else(!is.na(result_Cl.mg_L),0,NA),
+         result_DIN.mg_L = as.numeric(NOX..mg.L.),
+         gtlt_DIN.mg_L = if_else(NOX.note == "<" | NOX.note == "J", 1, 0),
+         gtlt_DIN.mg_L = if_else(is.na(result_DIN.mg_L), NA, gtlt_DIN.mg_L),
+         result_chla.Pcorr.ug_L = as.numeric(chla.Pcorr.ug_L),
+         result_chla.nonPcorr.ug_L = as.numeric(chla.nonPcorr.ug_L),
+         gtlt_chla.Pcorr.ug_L = ifelse(Chlor.a.note == "<" & !is.na(result_chla.Pcorr.ug_L), 1, 0),
+         gtlt_chla.Pcorr.ug_L = ifelse(is.na(result_chla.Pcorr.ug_L), NA, gtlt_chla.Pcorr.ug_L),
+         gtlt_chla.nonPcorr.ug_L = ifelse(Chlor.a.note == "<" & !is.na(result_chla.nonPcorr.ug_L), 1, 0),
+         gtlt_chla.nonPcorr.ug_L = ifelse(is.na(result_chla.nonPcorr.ug_L), NA, gtlt_chla.nonPcorr.ug_L),
+         result_TP.mg_L = as.numeric(Total.P.surface..mg.L.),
+         gtlt_TP.mg_L = case_when(TP.surface.note == "<" ~ 1,
+                                  (TP.surface.note != "<" & !is.na(result_TP.mg_L)) ~ 0,
+                                  is.na(result_TP.mg_L) ~ NA),
+         result_TKN.mg_L = as.numeric(Total.Kjeldahl.N..mg.L.), 
+         gtlt_TKN.mg_L = case_when(Kjeldahl.N.note == "<" ~ 1,
+                                   (Kjeldahl.N.note != "<" & !is.na(result_TKN.mg_L)) ~ 0,
+                                   is.na(result_TKN.mg_L) ~ NA),
+         result_secchi.m = as.numeric(Secchi..m.),
+         gtlt_secchi.m = case_when(grepl("LIW", SD.note..water.color) ~ 100,
+                                   grepl("bottom", SD.note..water.color) ~ 100,
+                                   grepl(">", SD.note..water.color) ~ 100),
+         gtlt_secchi.m = if_else(!is.na(result_secchi.m) & is.na(gtlt_secchi.m), 0, gtlt_secchi.m)) %>% 
+  select(-Conduc.surface..mS.cm., -NOX.note, -Chloride.Surface..mg.L.,
+         -NOX..mg.L., -TP.surface.note, -Total.P.surface..mg.L., -Total.Kjeldahl.N..mg.L.,
+         -Kjeldahl.N.note, -Secchi..m., -Chlor.a.note, -SD.note..water.color, -chla.Pcorr.ug_L, -chla.nonPcorr.ug_L) %>% 
+  mutate(DOW = as.character(DOW), 
+         dataSource = "CityEagan")
+
+####Pivot longer and filter for surface samples####
+EaganLong <- Cleangan %>%
+  pivot_longer(cols = c(starts_with("result"), starts_with("gtlt")),
+     names_to = c(".value","parameter"),
+     names_pattern = '(.*?)_(.*)') %>%
+  filter(!is.na(result)) %>%
+  mutate(gtlt = if_else(is.na(gtlt),0,gtlt)) %>%
+
+ #already filtered for depth by selecting "surface" reported data
+ #no multiple site reports so collapse any duplicates
+  group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#double check that you have one value per lake x date! Should return no duplicates
+  EaganLong %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+# Add Eagan data to MPCA if the lake x date isn't already represented
+EG_new <- anti_join(EaganLong,MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD, by = c("DOW", "sampleDate", "sampleYear", "parameter"))
+MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG <- bind_rows(MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD,EG_new)
+
+
+#double check for any lake x date x parameter duplicates
+  MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+```
+
+
+```{r DNR}
+setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Data")
+
+DNR <- read.csv("MNDNR_WQ_1958_2014_forJF.csv")
+  
+DNR1 <- DNR %>%
+  mutate(DATECOL = ifelse(substr(DATECOL,0,2) > 20, 
+         str_c("19",DATECOL), str_c("20",DATECOL))) %>%
+  mutate(sampleDate = as.Date(DATECOL, "%Y%m%d")) %>%
+  mutate(DOW = ifelse(str_length(DOWID) == 6, str_c(DOWID, "00"), DOWID)) %>%
+  filter(str_detect(DOW, "X", negate = TRUE)) %>%
+  select (DOW, YEARCOLL, sampleDate, TPPPM, TPCODE, CONDUMHO, CONDCODE, 
+          NO2_3PPM, NO2_3COD, TKNPPM, TKNCODE, NH3_NPPM, NH3CODE, 
+          CHLAPPBTR, CHLACODETR, CHLAPPBPH, CHLACODEPH, SAMPLELOCATION) %>%
+  rename(sampleYear = YEARCOLL, result_TP.mg_L = TPPPM, result_DIN.mg_L = NO2_3PPM, result_TKN.mg_L = TKNPPM, 
+         result_NH4.mg_L = NH3_NPPM, result_spCond.uS_cm = CONDUMHO, result_chla.nonPcorr.ug_L = CHLAPPBTR,
+         result_chla.Pcorr.ug_L = CHLAPPBPH) %>%
+ filter(str_detect(SAMPLELOCATION, "BOTTOM" , negate = TRUE),
+        str_detect(SAMPLELOCATION, "MID", negate = TRUE),
+        str_detect(SAMPLELOCATION, "10'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "8'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "40'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "30'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "12'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "15'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "16'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "22'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "13'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "4 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "4.5 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "26 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "28 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "18.5 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "18 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "25 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "29.5 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "31 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "90'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "80'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "70'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "64'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "65'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "47'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "45'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "43'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "42'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "37'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "26'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "36'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "31'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "32'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "35'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "23'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "25.5'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "39'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "3 METERS", negate = TRUE),
+        str_detect(SAMPLELOCATION, "33'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "34'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "25'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "20'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "29'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "17'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "19'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "21'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "14'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "20'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "100", negate = TRUE),
+        str_detect(SAMPLELOCATION, "44'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "5'", negate = TRUE),
+        str_detect(SAMPLELOCATION, "2 METERS", negate = TRUE)) %>%
+  mutate(gtlt_TP.mg_L = case_when(is.na(result_TP.mg_L) ~ NA,
+                                  TPCODE != "" ~ 1,
+                                  !is.na(result_TP.mg_L) & TPCODE == "" ~ 0),
+         gtlt_TKN.mg_L = case_when(is.na(result_TKN.mg_L) ~ NA,
+                                   !is.na(result_TKN.mg_L) ~ 0),
+         gtlt_DIN.mg_L = case_when(is.na(result_DIN.mg_L) ~ NA,
+                                   NO2_3COD != "" ~ 1,
+                                   !is.na(result_DIN.mg_L) & NO2_3COD == "" ~ 0),
+         gtlt_spCond.uS_cm = case_when(is.na(result_spCond.uS_cm) ~ NA,
+                                       !is.na(result_spCond.uS_cm) ~ 0),
+         gtlt_NH4.mg_L = case_when(is.na(result_NH4.mg_L) ~ NA,
+                                       NH3CODE != "" ~ 1,
+                                       !is.na(result_NH4.mg_L) & NH3CODE == "" ~ 0),
+         gtlt_chla.Pcorr.ug_L = case_when(is.na(result_chla.Pcorr.ug_L) ~ NA,
+                                          !is.na(result_chla.Pcorr.ug_L) ~ 0),
+         gtlt_chla.nonPcorr.ug_L = case_when(is.na(result_chla.nonPcorr.ug_L) ~ NA,
+                                             CHLACODETR == "0.1K" ~ 1,
+                                       !is.na(result_chla.nonPcorr.ug_L) & CHLACODETR != "0.1K" ~ 0)) %>%
+  select(-NO2_3COD, -CHLACODETR, -CHLACODEPH, -NH3CODE, -TPCODE, 
+         -TKNCODE, -CONDCODE) %>%
+  filter(!is.na(result_chla.Pcorr.ug_L) |
+         !is.na(result_chla.nonPcorr.ug_L) |
+         !is.na(result_spCond.uS_cm) |
+         !is.na(result_TP.mg_L) |
+         !is.na(result_TKN.mg_L) |
+         !is.na(result_DIN.mg_L) |
+         !is.na(result_NH4.mg_L)) %>%
+  mutate(dataSource = "DNR")
+
+####Pivot longer and filter for surface samples####
+DNRLong <- DNR1 %>%
+  pivot_longer(cols = c(starts_with("result"), starts_with("gtlt")),
+     names_to = c(".value","parameter"),
+     names_pattern = '(.*?)_(.*)') %>%
+  filter(!is.na(result)) %>%
+  mutate(gtlt = if_else(is.na(gtlt),0,gtlt))
+
+station_check <- DNRLong %>% 
+select(DOW, SAMPLELOCATION) %>%
+group_by(DOW) %>%
+summarise(units = list(unique(SAMPLELOCATION))) 
+  
+#The depth/site reporting for this data is really challenging to parse.
+#For now I'm going to average within and then across sites like I would for MPCA
+#however, sometimes a "site" is actually a different depth
+#If relying heavily on DNR data, perhaps doublecheck if this averaging made anything not come out quite right
+
+DNRLong1 <- DNRLong %>% 
+  group_by(DOW, sampleDate, sampleYear, parameter, SAMPLELOCATION, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup() %>%
+
+  group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#double check that you have one value per lake x date! Should return no duplicates
+  DNRLong1 %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+# Add DNR data to MPCA if the lake x date isn't already represented
+DNR_new <- anti_join(DNRLong1,MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG, 
+                     by = c("DOW", "sampleDate", "sampleYear", "parameter"))
+MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR <- bind_rows(MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG,DNR_new)
+
+
+#double check for any lake x date x parameter duplicates
+  MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+```
+
+```{r Nine Mile Creek}
+setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Data")
+
+# clean up Nine Mile Creek dataset to match MPCA format
+NMCWD_raw <- read.xlsx("NMCWD 2021-2021 Water Quality Data_05072024.xlsx", detectDates = TRUE, colNames = FALSE)
+
+names(NMCWD_raw) <- paste(NMCWD_raw[1, ], NMCWD_raw[3, ], NMCWD_raw[4, ],sep = "_")
+
+#I decided not to use TN because it was often equal to TKN, or lower(?), or was a sum of TKN and nitrate even when nitrate was below detection.
+
+#select all the data we want, adjust row names, and add DOWs
+NMCWD <- NMCWD_raw[-(1:4),] %>%
+  rename(sampleDate = NA_NA_Date,
+         LAKENAME = Parameter_Units_Location,
+         result_Cl.mg_L = names(NMCWD_raw[5]),
+         result_chla.Pcorr.ug_L = names(NMCWD_raw[6]),
+         result_NH4.mg_L = names(NMCWD_raw[7]),
+         result_DIN.mg_L = names(NMCWD_raw[8]),
+         result_TKN.mg_L = names(NMCWD_raw[10]),
+         result_TP.mg_L = names(NMCWD_raw[13]),
+         result_secchi.m = names(NMCWD_raw[23]),
+         result_spCond.uS_cm = names(NMCWD_raw[24]),
+         Depth = NA_NA_Depth) %>%
+  mutate(sampleDate = as.numeric(substr(sampleDate, 1, 5)),
+         sampleDate = as.Date(sampleDate, origin = "1899-12-30")) %>%
+  mutate(DOW = case_when(LAKENAME == "Bush" ~ "27004700",
+                         LAKENAME == "Cornelia_NB" ~ "27002800",
+                         LAKENAME == "Cornelia_SB" ~ "27002800",
+                         LAKENAME == "Edina" ~ "27002900",
+                         LAKENAME == "Minnetoga" ~ "27008800",
+                         LAKENAME == "Mirror" ~ "27005500",
+                         LAKENAME == "Norm_E" ~ "27104501",
+                         LAKENAME == "NW_Anderson" ~ "27006201",
+                         LAKENAME == "SE_Anderson" ~ "27006202",
+                         LAKENAME == "SW_Anderson" ~ "27006203"),
+         SITE = case_when(LAKENAME == "Cornelia_NB" ~ "101",
+                          LAKENAME == "Cornelia_SB" ~ "102",
+                          TRUE ~ "100")) %>%
+  mutate(across(c(result_Cl.mg_L, result_chla.Pcorr.ug_L, result_NH4.mg_L, result_DIN.mg_L, result_TKN.mg_L,
+                result_TP.mg_L, result_secchi.m, result_spCond.uS_cm), 
+                ~na_if(., "--"))) %>%
+  select(DOW, SITE, sampleDate, Depth, result_Cl.mg_L, result_chla.Pcorr.ug_L, result_NH4.mg_L, 
+         result_DIN.mg_L, result_TKN.mg_L,result_TP.mg_L, result_secchi.m, result_spCond.uS_cm) %>%
+  filter(!is.na(DOW))
+
+#Fix depth formatting, add gtlt, and pivot longer
+NMCWD1 <- NMCWD %>%
+  mutate(Depth.Unit = gsub("[^a-zA-Z]", "", Depth),
+         Depth.value = gsub("[^0-9\\.\\-]", "", Depth),
+         Depth.value = case_when(Depth.value == "0-2" ~ "1",
+                                 Depth.value == "0-1" ~ "0.5",
+                                 Depth.value == "0-0.7" ~ "0.35",
+                                 Depth.value == "0-1.5" ~ "0.75",
+                                 Depth.value == "0-0.2" ~ "0.1",
+                                 Depth.value == "0-0.8" ~ "0.4",
+                                 TRUE ~ Depth.value),
+         Depth = case_when(Depth.Unit == "m" ~ as.numeric(Depth.value),
+                           Depth.Unit == "ft" ~ as.numeric(Depth.value)/3.281,
+                           Depth.Unit == "M" ~ as.numeric(Depth.value))) %>%
+  select(-Depth.Unit, -Depth.value) %>%
+  #handle gtlt flags
+  mutate(gtlt_DIN.mg_L = if_else(str_detect(result_DIN.mg_L, "<"), 1, 0),
+         gtlt_NH4.mg_L = if_else(str_detect(result_NH4.mg_L, "<"), 1, 0),
+         gtlt_Cl.mg_L = if_else(str_detect(result_Cl.mg_L, "<"), 1, 0),
+         gtlt_TKN.mg_L = if_else(str_detect(result_TKN.mg_L, "<"), 1, 0),
+         gtlt_TP.mg_L = if_else(str_detect(result_TP.mg_L, "<"), 1, 0),
+         gtlt_secchi.m = if_else(str_detect(result_secchi.m, "<"), 1, 0),
+         gtlt_secchi.m = if_else(str_detect(result_secchi.m, ">"), 100, gtlt_secchi.m),
+         gtlt_spCond.uS_cm = if_else(str_detect(result_spCond.uS_cm, "<"), 1, 0),
+         gtlt_chla.Pcorr.ug_L = if_else(str_detect(result_chla.Pcorr.ug_L, "<"), 1, 0)) %>%
+  mutate(result_DIN.mg_L = as.numeric(gsub("[^0-9\\.]", "", result_DIN.mg_L)),
+         result_NH4.mg_L = as.numeric(gsub("[^0-9\\.]", "", result_NH4.mg_L)),
+         result_Cl.mg_L = as.numeric(gsub("[^0-9\\.]", "", result_Cl.mg_L)),
+         result_TKN.mg_L = as.numeric(gsub("[^0-9\\.]", "", result_TKN.mg_L)),
+         result_TP.mg_L = as.numeric(gsub("[^0-9\\.]", "", result_TP.mg_L)),
+         result_secchi.m = as.numeric(gsub("[^0-9\\.]", "", result_secchi.m)),
+         result_spCond.uS_cm = as.numeric(gsub("[^0-9\\.]", "", result_spCond.uS_cm)),
+         result_chla.Pcorr.ug_L = as.numeric(gsub("[^0-9\\.]", "", result_chla.Pcorr.ug_L)))
+
+####Pivot longer, filter for surface samples, and deduplicate####
+NMCWDLong <- NMCWD1 %>%
+  pivot_longer(cols = c(starts_with("result"), starts_with("gtlt")),
+     names_to = c(".value","parameter"),
+     names_pattern = '(.*?)_(.*)') %>%
+  filter(!is.na(result)) %>%
+  mutate(gtlt = if_else(is.na(gtlt),0,gtlt),
+         sampleYear = year(sampleDate),
+         dataSource = "NMCWD") %>%
+  
+
+ #slice out the most shallow value from any profiles taken
+      #Note that this returns all rows that have the min sampleDepth so there might be multiple rows per site/date
+      #This is usually because two different groups took a surface sample at the same site on the same day
+      #These will be averaged out later
+  rowwise() %>%
+  group_by(DOW, sampleDate, SITE, parameter) %>% 
+  filter(Depth == min(Depth)) %>%
+  ungroup() %>%
+  
+  #filter for only surface samples
+  filter(Depth <= 2) %>%
+  select(-Depth) %>%
+  
+#now average multiple, unique results reported for the same site x lake x date
+  group_by(DOW, sampleDate, sampleYear, parameter, SITE, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup() %>%
+
+#and finally collapse spatial surveys
+  group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
+  summarise(result = mean(result), gtlt = mean(gtlt)) %>%
+  ungroup()
+
+#double check that you have one value per lake x date! Should return no duplicates
+  NMCWDLong %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+# Add NMC data to MPCA if the lake x date isn't already represented
+NMCWD_new <- anti_join(NMCWDLong,MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR, 
+                     by = c("DOW", "sampleDate", "sampleYear", "parameter"))
+MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR_NMCWD <- bind_rows(MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR,NMCWD_new)
+
+
+#double check for any lake x date x parameter duplicates
+  MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR_NMCWD %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+```
+
+Final cleaning of the data!
+
+```{r}
+AllData <- MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR_NMCWD %>% 
+  mutate(county = case_when(str_detect(DOW, "^02") ~ "Anoka",
+                            str_detect(DOW, "^10") ~ "Carver", 
+                            str_detect(DOW, "^19") ~ "Dakota",
+                            str_detect(DOW, "^27") ~ "Hennepin",
+                            str_detect(DOW, "^62") ~ "Ramsey",
+                            str_detect(DOW, "^70") ~ "Scott",
+                            str_detect(DOW, "^82") ~ "Washington",
+                            str_detect(DOW, "^30") ~ "Anoka")) %>% #30 is for typo lake which is split between counties
+  filter(str_detect(DOW, "^13" , negate = TRUE)) %>% #filter out Chisago County
+  filter(!is.na(sampleDate)) %>% #filter out NA sample dates that got introduced through DNR data
+  mutate(Julian = yday(sampleDate), Month = month(sampleDate)) %>% 
+  #filter((Julian >= 152) & (Julian <= 258)) %>% #June 1 through Sep 15
+  #select(-Julian) %>% 
+  mutate(result = if_else(parameter == "chla.Pcorr.ug_L" & result < 0, 0, result),
+         result = if_else(parameter == "chla.nonPcorr.ug_L" & result < 0, 0, result)) %>%
+  mutate(parameter = if_else(parameter == "DIN.mg_L", "NOX.mg_L", parameter)) %>%
+  mutate(dataSource = if_else(dataSource == "MCPA", "MPCA", dataSource))
+
+#look for duplicates
+test <- AllData %>%
+  group_by(DOW, sampleDate, parameter) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n > 1L)
+
+#Remove any DOWs that have < 5 years of data
+DOW_check <- AllData %>%
+  select(DOW, sampleYear) %>%
+  unique() %>%
+  group_by(DOW) %>%
+  summarise(n = dplyr::n(), .groups = "drop") %>%
+  filter(n < 5L)
+
+AllData1 <- subset(AllData, !(DOW %in% DOW_check$DOW))
+DOWs <- unique(AllData1$DOW)
+
+#pivot wider, if you prefer that
+AllDataWide <- AllData1 %>%
+ pivot_wider(names_from = parameter, values_from = c(gtlt, result, dataSource))
+
+#Take a peek at how much each data set contributed
+WMO_check <- AllData1 %>%
+  group_by(dataSource) %>%
+  summarise(n = dplyr::n(), .groups = "drop")
+  
+
+#select what you want and export!
+Timeseries <- AllData1 
+
+# timeseries data
+write.csv(Timeseries, file = "Timeseries_v6.csv", row.names = F)
+
+#simplify the dataset for EDI
+Timeseries_EDI <- Timeseries %>%
+  select(DOW, sampleDate, parameter, result, gtlt, dataSource, county)
+
+write.csv(Timeseries_EDI, file = "Timeseries_v6_forEDI.csv", row.names = F)
+```
