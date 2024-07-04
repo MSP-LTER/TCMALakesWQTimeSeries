@@ -340,23 +340,24 @@ MPCAepi <- MPCAOrg3 %>%
 
 Now we're going to handle de-duplication. There are several reasons something could be duplicated at this point:
 1) Samples from multiple organizations that went to the same site on the same day
-2) The same organization reporting multiple samples for one site
-3) Samples from multiple sites on the same lake on the same day (spatial survey)
+2) A single sample was collected but the result was reported to MPCA more than one (often by multiple groups, e.g. the Met Council and a WMO)
+3) The same organization reporting multiple samples for one site
+4) Samples from multiple sites on the same lake on the same day (spatial survey)
 
 I'll start by averaging so there is a single value per site x lake x date
 Then I will average across sites so there is a single value per lake x date
 
 This is easier said than done because within a single spatial survey or multiple samples of the same site there could be some values that are above detection or below detection. I'm going to handle this problem in three steps.
 
-1) If the same result value is reported twice as both < and no flag, I will keep the value with a flag. It is not uncommon for samples at the detection to not be reported as such (~117 samples)
-2) Once this is handled, if there are a mix of result values and a mix of < and no flag I will use the detection limit as the value for averaging, but I will include a flag that indicates BDL values have been mixed in
+1) If the same result value is reported twice but one is flagged (<) and the other has no flag flag, I will keep the value with a flag. This isn't common, but does happen (~20 samples)
+2) Once this is handled, if there are a mix of result values and a mix of < and no flag I will use the reported value (usually the detection limit) as the value for averaging, but I will include a flag that indicates BDL values have been mixed in
 3) Finally, when I collapse the spatial surveys, I will do the same thing as step 2 and treat the detection limit as the value but flag the average value.
 
 ```{r}
 
 
-#deduplicate any exact values that were reported multiple times (~2500 results)
-#also do step #1 of handling gtlt flags (~117 results)
+#deduplicate any exact values that were reported multiple times (~11,000 results)
+#also do step #1 of handling gtlt flags (~20 results)
 MPCAepi1 <- MPCAepi %>%
   mutate(gtlt = case_when(gtlt == "< " ~ 1,
                           gtlt == "> " ~ 100,
@@ -1580,8 +1581,7 @@ AllData <- MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR_NMCWD %>%
   #select(-Julian) %>% 
   mutate(result = if_else(parameter == "chla.Pcorr.ug_L" & result < 0, 0, result),
          result = if_else(parameter == "chla.nonPcorr.ug_L" & result < 0, 0, result)) %>%
-  mutate(parameter = if_else(parameter == "DIN.mg_L", "NOX.mg_L", parameter)) %>%
-  mutate(dataSource = if_else(dataSource == "MCPA", "MPCA", dataSource))
+  mutate(parameter = if_else(parameter == "DIN.mg_L", "NOX.mg_L", parameter))
 
 #look for duplicates
 test <- AllData %>%
