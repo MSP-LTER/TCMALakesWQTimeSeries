@@ -10,6 +10,8 @@ There is one reported value per lake x date x parameter which means that spatial
 (2) Duplicate sampling efforts were averaged by sampling site first, then by lake.
 (3) Some lakes with multiple basins were treated as a single lake and others were treated as separate lakes. See details below.
 
+The data brought together in this database has undergone QAQC by the organizations that originally collected it, as well as a screening process during data harmonization. While we believe that the resulting dataset is robust, we cannot guarantee that it is free of errors or inaccuracies.
+
 Metadata:
 DOW*			Lake ID number used by MPCA
 sampleDate		Date of sampling, YYYY-MM-DD
