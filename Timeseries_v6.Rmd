@@ -182,7 +182,7 @@ Shady Oak (27008900)
   N (27008901) and Middle (27008902) bays will be combined under main lake DOW
 
 Marion (19002600)
-  Only use data from Marion East (19002601). Marion Middle (19002602) only has 3 data points from one year so it seems     unnecessary to average those into the more consistent East monitoring even though E and Middle are considered one lake.
+  Only use data from Marion East (19002601). Marion Middle (19002602) only has 3 data points from one year so it seems unnecessary to average those into the more consistent East monitoring even though E and Middle are considered one lake.
 
 Whaletail
   Separate N (27018401) and S (27018402) basins  
@@ -1573,7 +1573,7 @@ AllData <- MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR_NMCWD %>%
                             str_detect(DOW, "^62") ~ "Ramsey",
                             str_detect(DOW, "^70") ~ "Scott",
                             str_detect(DOW, "^82") ~ "Washington",
-                            str_detect(DOW, "^30") ~ "Anoka")) %>% #30 is for typo lake which is split between counties
+                            str_detect(DOW, "^30") ~ "Anoka")) %>% #30 is for Typo lake which is split between counties
   filter(str_detect(DOW, "^13" , negate = TRUE)) %>% #filter out Chisago County
   filter(!is.na(sampleDate)) %>% #filter out NA sample dates that got introduced through DNR data
   mutate(Julian = yday(sampleDate), Month = month(sampleDate)) %>% 
@@ -1581,7 +1581,7 @@ AllData <- MPCA_RC_SWWD_CCWMO_RPBCWD_MCES_ACD_EG_DNR_NMCWD %>%
   #select(-Julian) %>% 
   mutate(result = if_else(parameter == "chla.Pcorr.ug_L" & result < 0, 0, result),
          result = if_else(parameter == "chla.nonPcorr.ug_L" & result < 0, 0, result)) %>%
-  mutate(parameter = if_else(parameter == "DIN.mg_L", "NOX.mg_L", parameter))
+  mutate(parameter = if_else(parameter == "DIN.mg_L", "NOX.mg_L", parameter)) #rename DIN.mg_L to NOX.mg_L because it doesn't contain NH4 data
 
 #look for duplicates
 test <- AllData %>%
@@ -1609,9 +1609,23 @@ WMO_check <- AllData1 %>%
   group_by(dataSource) %>%
   summarise(n = dplyr::n(), .groups = "drop")
   
+```
 
+As we find errors in the dataset (often due to errors on the submitter's part) they can be fixed here
+
+In spring 2025 we noticed that the 2023 secchi depth data for Twin Lake Upper (27004201) and Middle (27004202) was measured in ft but assigned the unit of m. The secchi depth was greater than the depth of the lake in some instances.
+
+```{r}
+AllData2 <- AllData1 %>%
+  mutate(result = case_when((DOW == "27004201" | DOW == "27004202") & parameter == "secchi.m" & sampleYear == 2023 ~ result/3.281,
+                             TRUE ~ result))
+
+```
+
+
+```{r}
 #select what you want and export!
-Timeseries <- AllData1 
+Timeseries <- AllData2 
 
 # timeseries data
 write.csv(Timeseries, file = "Timeseries_v6.csv", row.names = F)
