@@ -11,7 +11,6 @@ History: In 2022 Grace Neumiller took an initial stab at harmonizing all of this
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-knitr::opts_knit$set(root.dir = "/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie Timeseries Files/Outputs")
 
 library(openxlsx)
 library(dplyr)
@@ -29,7 +28,7 @@ This section double checks units, removes a few bad data points, and filters dat
 
 ```{r Initial MPCA Cleaning}
 # load in combined MPCA data set
-MPCAtimeseries1 <- read.csv("MPCA_MassDownload_20240521.csv")
+MPCAtimeseries1 <- read.csv("Raw Data/MPCA_MassDownload_20240521.csv")
 
 # select all desired parameters
 # units should be
@@ -170,6 +169,46 @@ group_by(parameter) %>%
 summarise(units = list(unique(resultUnit))) 
 ```
 
+In summer 2024 we found that some organizations reported secchi depth values in ft but reported the units as m
+This seems to happen inconsistently from year to year and org to org, so it's hard to find all the problems
+The problems fixed here were identified by secchi depths reported that were greater than the max depth of the lake
+This problem is particularly hard to catch when secchi is < 1m 
+(because it's hard to tell if a year-to-year change in secchi of 0.3m -> 1m is a real signal or a unit error)
+I'm in communication with MCPA about this and they are fixing the database, so if we re-scrape data we may need to skip this step
+
+```{r}
+Secchi_flag <- read.csv("Raw Data/Secchi_WrongUnit.csv") %>%
+  mutate(DOW = fixlakeid(DOW))
+
+
+#pull out all samples that are reported as m but are actually ft
+flag_list <- list()
+
+for (i in 1:dim(Secchi_flag)[1]) {
+  flag_sub <- MPCAOrg %>%
+  filter(DOW == Secchi_flag$DOW[i] & 
+         collectingOrg == Secchi_flag$collectingOrg[i] & 
+         sampleYear == Secchi_flag$sampleYear[i] &
+         parameter == "Depth, Secchi disk depth")
+  
+  flag_list[[i]] <- flag_sub
+}
+
+flags = do.call(rbind, flag_list)
+
+#remove these samples from the dataset
+MPCAnoflags <- anti_join(MPCAOrg, flags, by = c("collectingOrg", "parameter", "result", "sampleDate", "DOW", "gtlt"))
+
+#fix the unit problem
+flags_fixed <- flags %>%
+  mutate(result = result/3.281)
+  
+#add the data back
+MPCAOrg0 <- rbind(flags_fixed, MPCAnoflags)
+
+```
+
+
 MULTI-BASIN ADJUSTMENTS
 
 Many metro lakes have multiple basins or are divided by roads/culverts. Usually the various basins are monitored separately, but we need to decide whether these should be treated like multiple monitoring stations on a single lake or treated as distinct lakes. The following decisions were made:
@@ -203,7 +242,7 @@ Forest W (82015901), Central (82015902), and E (82015903)
   
 ```{r}
 #Append identifiers to site IDs when combining DOWs in case each DOW has the same site #
-MPCAOrg1 <- MPCAOrg %>%
+MPCAOrg1 <- MPCAOrg0 %>%
   mutate(siteID = case_when(DOW == "27002801" ~ paste0(siteID, "N"),
                             DOW == "27002802" ~ paste0(siteID, "S"),
                             DOW == "27019101" ~ paste0(siteID, "W"),
@@ -665,6 +704,7 @@ setwd("/Users/catherinepolik/Desktop/Desktop/Grad School/Year 1/Research/Katie T
 #The file I am loading in is slightly different fromt the file we recieved directly from SWWD
 #I manually fixed a problem with the DOW of Powers and Markgraf lakes in the SWWDLakes.csv file
 #manually fixed a typo for Fish DOW (orignially listed as 82012300 for 2 data points)
+#I also manually fixed a ft instead of m secchi depth error for a measurement on 5/17/2021 for 82000200
 
 #Wilmes is reported here as 82009000 but I believe every sample marked as that is actually 82009001
       #If it's 82009002 it's recorded as such
@@ -914,7 +954,8 @@ RPBCWD1 <- RPBCWD %>%
   RPBCWDLong <- RPBCWD1 %>%
   group_by(DOW, sampleDate, sampleYear, parameter, dataSource) %>%
   summarise(result = mean(result), gtlt = mean(gtlt)) %>%
-  ungroup()
+  ungroup() %>%
+  filter(result < 5000) #remove very high secchi values
 
 #double check that you have one value per lake x date! Should return no duplicates
   RPBCWDLong %>%
@@ -1611,21 +1652,10 @@ WMO_check <- AllData1 %>%
   
 ```
 
-As we find errors in the dataset (often due to errors on the submitter's part) they can be fixed here
-
-In spring 2025 we noticed that the 2023 secchi depth data for Twin Lake Upper (27004201) and Middle (27004202) was measured in ft but assigned the unit of m. The secchi depth was greater than the depth of the lake in some instances.
-
-```{r}
-AllData2 <- AllData1 %>%
-  mutate(result = case_when((DOW == "27004201" | DOW == "27004202") & parameter == "secchi.m" & sampleYear == 2023 ~ result/3.281,
-                             TRUE ~ result))
-
-```
-
 
 ```{r}
 #select what you want and export!
-Timeseries <- AllData2 
+Timeseries <- AllData1 
 
 # timeseries data
 write.csv(Timeseries, file = "Timeseries_v6.csv", row.names = F)
